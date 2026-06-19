@@ -1,5 +1,3 @@
-# HSRP-vPC-Cisco-Nexus-9000v
-
 # HSRP + vPC on Cisco Nexus 9000v — Production-Style Reference
 
 A lab build of First-Hop Redundancy (HSRP) on a pair of Cisco Nexus 9000v
@@ -17,6 +15,7 @@ Built and tested in EVE-NG on Proxmox.
 - [IP / VLAN Plan](#ip--vlan-plan)
 - [Configuration — N9K-1 (Primary)](#configuration--n9k-1-primary)
 - [Configuration — N9K-2 (Secondary)](#configuration--n9k-2-secondary)
+- [vPC Member Ports (MLAG) — Dual-Homed Devices](#vpc-member-ports-mlag--dual-homed-devices)
 - [Verification](#verification)
 - [Design Notes](#design-notes)
 - [HSRP vs VRRP](#hsrp-vs-vrrp)
@@ -54,14 +53,20 @@ routed — so aggressive sub-second timers are unnecessary.
         │  N9K-1   │═══════════════════════════════│  N9K-2   │
         │ (vPC pri)│                               │ (vPC sec)│
         │          │── keepalive (Eth1/3, /30) ────│          │
-        └────┬─────┘                               └────┬─────┘
-             │                                           │
-             │            uplink (Eth1/49)               │
-             └────────── vPC to access / hosts ──────────┘
+        │ Po10/vpc10│                              │ Po10/vpc10│
+        └────┬─────┘                               └─────┬────┘
+       Eth1/10│                                          │Eth1/10
+              └──────────────┐         ┌─────────────────┘
+                           ┌─┴─────────┴─┐
+                           │  Access SW  │  <- one LACP port-channel
+                           └──────┬──────┘     (split across both chassis)
+                                  │
+                              Hosts (VLAN 10/20/30)
 ```
 
 - **Peer-link** — Po1 (Eth1/1-2), trunk carrying data VLANs + vPC control plane.
 - **Keepalive** — Eth1/3, dedicated routed P2P link in its own VRF (heartbeat only).
+- **vPC member port (MLAG)** — Po10 (Eth1/10), dual-homed trunk to the access switch.
 - **Uplink** — Eth1/49, routed uplink to core (tracked for HSRP failover).
 
 ---
@@ -257,6 +262,95 @@ interface Vlan30
     authentication md5 key-chain HSRP-KEY
     ip 10.10.30.1
 ```
+
+---
+
+## vPC Member Ports (MLAG) — Dual-Homed Devices
+
+On Nexus, **MLAG = vPC**. The peer-link + keepalive + vPC domain you configured
+above *is* the MLAG control plane. A **vPC member port** is the downstream LAG that
+is split across both switches but appears as a single LACP port-channel to the
+device connected below — that device has no idea (and needs no idea) that its two
+links land on different chassis.
+
+Nothing special is added to HSRP for this. The member port is a Layer-2 trunk
+carrying the same VLANs that have HSRP SVIs. The dual-homed device points its
+default gateway at the HSRP VIP, and thanks to vPC active/active forwarding,
+whichever physical link the device hashes onto, that Nexus routes the traffic
+locally — no hairpin across the peer-link.
+
+**The rule:** both peers configure a port-channel with the **same `vpc <id>`**. That
+shared ID tells the pair "these two local port-channels are the same downstream
+LAG."
+
+### On the Nexus pair (identical on N9K-1 and N9K-2)
+
+```
+interface port-channel10
+  switchport
+  switchport mode trunk
+  switchport trunk allowed vlan 10,20,30
+  spanning-tree port type edge trunk
+  vpc 10
+
+interface Ethernet1/10
+  switchport
+  switchport mode trunk
+  switchport trunk allowed vlan 10,20,30
+  channel-group 10 mode active
+  no shutdown
+```
+
+- The **`vpc 10`** ID must match on both peers. The port-channel *number* need not
+  equal the vPC ID, but matching them (Po10 / vpc 10) is standard convention.
+- Use **LACP** (`mode active`) toward the device.
+- `spanning-tree port type edge trunk` only for hosts/servers; for a real switch
+  downstream, use a normal trunk (`port type network` if it's another bridge).
+- Configure on **both** peers — if only one side has `vpc 10`, it won't form a vPC.
+
+### On the downstream device (plain LACP — example IOS access switch)
+
+```
+interface range Gi0/1 - 2
+  channel-group 1 mode active
+
+interface port-channel1
+  switchport mode trunk
+  switchport trunk allowed vlan 10,20,30
+```
+
+### Consistency (the usual gotcha)
+
+A vPC member port-channel must be **consistent across both peers** — allowed VLANs,
+mode, speed, MTU, STP type, etc. **Type-1** mismatches *suspend* the vPC; **Type-2**
+mismatches only warn.
+
+```
+show vpc consistency-parameters vpc 10
+```
+
+### Orphan ports (single-homed devices)
+
+Anything connected to only one Nexus is an **orphan port**; its traffic may cross
+the peer-link and can be isolated during certain failures. To make orphans go down
+when the peer-link drops:
+
+```
+interface Ethernet1/20
+  vpc orphan-port suspend
+```
+
+### Verifying the MLAG port
+
+```
+show vpc                          ! vPC10 listed, status "up", consistency "success"
+show port-channel summary         ! Po10 up, member ports bundled (P)
+show vpc consistency-parameters vpc 10
+show mac address-table vlan 10    ! host MAC learned on the vPC
+```
+
+From a host below: `ping 10.10.10.1` (the HSRP VIP) should succeed regardless of
+which uplink it hashes onto.
 
 ---
 
